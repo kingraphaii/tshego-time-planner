@@ -1,0 +1,45 @@
+{
+  "name": "Pace — sustainable time planning",
+  "short_name": "Pace",
+  "description": "A calm planner that protects sleep, balances roles, and notices overload before it happens.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "display_override": ["standalone", "minimal-ui"],
+  "orientation": "any",
+  "background_color": "#0b1220",
+  "theme_color": "#0b1220",
+  "lang": "en",
+  "categories": ["productivity", "lifestyle", "utilities"],
+  "icons": [
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ],
+  "shortcuts": [
+    { "name": "Today", "url": "./#/today", "short_name": "Today" },
+    { "name": "Week", "url": "./#/plan", "short_name": "Week" },
+    { "name": "Check-in", "url": "./#/reflect", "short_name": "Reflect" }
+  ]
+}

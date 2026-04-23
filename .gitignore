@@ -1,0 +1,35 @@
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.nova/
+.cursor/
+
+# Node (only here because icons were generated via `npx sharp-cli`)
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+
+# Logs and temp
+*.log
+tmp/
+*.tmp
+
+# Local history / backups
+*.bak
+*.orig
+.history/
