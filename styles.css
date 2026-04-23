@@ -447,6 +447,12 @@ select {
 .badge.badge-danger { background: var(--danger-soft); color: var(--danger); }
 
 /* ---------- Today view ---------- */
+.view-today {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
 .today-grid {
   display: grid;
   grid-template-columns: 2fr 1fr;
@@ -1189,7 +1195,6 @@ select {
   border: 1px solid var(--border);
   border-radius: var(--radius-xl);
   padding: 28px;
-  margin-bottom: 24px;
 }
 
 .onboard h2 { margin-bottom: 8px; font-size: 22px; }
@@ -1264,6 +1269,34 @@ select {
   letter-spacing: 0.08em;
   color: var(--text-subtle);
   margin-bottom: 10px;
+}
+
+/* ---------- Snapshot preview ---------- */
+.snapshot-preview {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  background: #0b1220;
+  border: 1px solid var(--border);
+  min-height: 260px;
+  outline: 1px solid rgba(255, 255, 255, 0.04);
+  outline-offset: -1px;
+}
+
+.snapshot-loading {
+  color: var(--text-subtle);
+  font-size: 13px;
+  padding: 40px;
+}
+
+.snapshot-img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  outline: 1px solid rgba(255, 255, 255, 0.1);
+  outline-offset: -1px;
 }
 
 /* ---------- Responsive ---------- */

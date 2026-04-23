@@ -56,26 +56,91 @@ const DEFAULT_STATE = {
    STATE
    ============================================================ */
 
-let state = loadState();
+let state = structuredClone(DEFAULT_STATE);
 
-function loadState() {
+/* IndexedDB wrapper. More durable than localStorage — survives storage-pressure
+   eviction that localStorage is first in line for, and installable PWAs can
+   request persistent-storage grants so the OS won't evict at all. */
+
+const DB_NAME = 'pace';
+const DB_VERSION = 1;
+const DB_STORE = 'kv';
+let _dbPromise = null;
+
+function idbOpen() {
+  if (_dbPromise) return _dbPromise;
+  _dbPromise = new Promise((resolve, reject) => {
+    if (!('indexedDB' in self)) return reject(new Error('IDB unavailable'));
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(DB_STORE)) db.createObjectStore(DB_STORE);
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+  return _dbPromise;
+}
+
+function idbGet(key) {
+  return idbOpen().then((db) => new Promise((resolve, reject) => {
+    const req = db.transaction(DB_STORE, 'readonly').objectStore(DB_STORE).get(key);
+    req.onsuccess = () => resolve(req.result ?? null);
+    req.onerror = () => reject(req.error);
+  }));
+}
+
+function idbSet(key, value) {
+  return idbOpen().then((db) => new Promise((resolve, reject) => {
+    const tx = db.transaction(DB_STORE, 'readwrite');
+    tx.objectStore(DB_STORE).put(value, key);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  }));
+}
+
+function hydrateState(raw) {
+  return {
+    ...structuredClone(DEFAULT_STATE),
+    ...raw,
+    settings: { ...DEFAULT_STATE.settings, ...(raw.settings || {}) },
+  };
+}
+
+async function loadStateAsync() {
+  try {
+    const stored = await idbGet('state');
+    if (stored) { state = hydrateState(stored); return; }
+  } catch (e) {
+    console.warn('[pace] IDB read failed, falling back to localStorage', e);
+  }
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return structuredClone(DEFAULT_STATE);
-    const parsed = JSON.parse(raw);
-    return { ...structuredClone(DEFAULT_STATE), ...parsed,
-      settings: { ...DEFAULT_STATE.settings, ...(parsed.settings || {}) } };
-  } catch {
-    return structuredClone(DEFAULT_STATE);
+    if (!raw) return;
+    state = hydrateState(JSON.parse(raw));
+    // Migrate legacy data to IDB and clear the old copy.
+    try {
+      await idbSet('state', state);
+      localStorage.removeItem(STORAGE_KEY);
+    } catch {}
+  } catch (e) {
+    console.warn('[pace] localStorage read failed', e);
   }
 }
 
+let saveTimer = null;
 function saveState() {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-  } catch (e) {
-    toast('Storage error: ' + e.message, 'error');
-  }
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    idbSet('state', state).catch(() => {
+      // IDB failed (private mode, quota, etc.) — fall back to localStorage.
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+      } catch (e) {
+        toast('Storage error: ' + e.message, 'error');
+      }
+    });
+  }, 80);
 }
 
 function setState(patch, { rerender = true } = {}) {
@@ -276,6 +341,437 @@ function computeInsights() {
 }
 
 /* ============================================================
+   SNAPSHOT — mentor-safe image export
+   ============================================================ */
+
+function snapshotRelativeTime(ts) {
+  if (!ts) return 'never';
+  const delta = Math.max(0, Date.now() - ts);
+  if (delta < 60_000) return 'just now';
+  if (delta < 3_600_000) return `${Math.floor(delta / 60_000)}m ago`;
+  if (delta < 86_400_000) return `${Math.floor(delta / 3_600_000)}h ago`;
+  const days = Math.floor(delta / 86_400_000);
+  return days === 1 ? 'yesterday' : `${days}d ago`;
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  const rad = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + rad, y);
+  ctx.arcTo(x + w, y,     x + w, y + h, rad);
+  ctx.arcTo(x + w, y + h, x,     y + h, rad);
+  ctx.arcTo(x,     y + h, x,     y,     rad);
+  ctx.arcTo(x,     y,     x + w, y,     rad);
+  ctx.closePath();
+}
+
+function snapWrapText(ctx, text, maxWidth, maxLines = 2) {
+  const words = String(text || '').split(' ');
+  const lines = [];
+  let line = '';
+  for (const w of words) {
+    const test = line ? line + ' ' + w : w;
+    if (ctx.measureText(test).width > maxWidth && line) {
+      lines.push(line);
+      if (lines.length === maxLines) return lines;
+      line = w;
+    } else {
+      line = test;
+    }
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+
+async function renderSnapshotBlob() {
+  try { if (document.fonts && document.fonts.ready) await document.fonts.ready; } catch {}
+
+  const DPR = 2;
+  const W = 1080, H = 1350;
+  const canvas = document.createElement('canvas');
+  canvas.width = W * DPR;
+  canvas.height = H * DPR;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(DPR, DPR);
+  ctx.textBaseline = 'alphabetic';
+
+  // Background
+  ctx.fillStyle = '#0b1220';
+  ctx.fillRect(0, 0, W, H);
+
+  // Top accent stripe
+  const stripe = ctx.createLinearGradient(0, 0, W, 0);
+  stripe.addColorStop(0, '#60a5fa');
+  stripe.addColorStop(1, '#a78bfa');
+  ctx.fillStyle = stripe;
+  ctx.fillRect(0, 0, W, 5);
+
+  const pad = 64;
+  const contentW = W - pad * 2;
+  let y = pad + 16;
+
+  // Brand
+  ctx.fillStyle = '#60a5fa';
+  ctx.font = '600 18px "Inter", system-ui, sans-serif';
+  ctx.fillText('PACE', pad, y + 14);
+
+  y += 56;
+
+  // Headline
+  const name = (state.settings.name && state.settings.name.trim()) || 'A calm week';
+  ctx.fillStyle = '#e5ecf5';
+  ctx.font = '700 44px "Inter", system-ui, sans-serif';
+  ctx.fillText(`${name}`, pad, y + 38);
+
+  y += 52;
+
+  const weekStart = startOfWeek(new Date(), state.settings.weekStartsMonday);
+  const weekEnd = addDays(weekStart, 6);
+  ctx.fillStyle = '#93a2bd';
+  ctx.font = '500 22px "Inter", system-ui, sans-serif';
+  ctx.fillText(`Week of ${shortDate(weekStart)} – ${shortDate(weekEnd)}`, pad, y + 22);
+
+  y += 78;
+
+  // ---- Stat row ----
+  const cardGap = 20;
+  const cardW = (contentW - cardGap) / 2;
+  const cardH = 160;
+  const totalHours = totalMinutesScheduledThisWeek() / 60;
+  const recent = recentCheckIns(14);
+  const sleepEntries = recent.filter((c) => c.sleepHours != null);
+  const avgSleep = sleepEntries.length
+    ? (sleepEntries.reduce((s, c) => s + c.sleepHours, 0) / sleepEntries.length)
+    : null;
+
+  snapDrawStatCard(ctx, pad,             y, cardW, cardH, totalHours.toFixed(1) + 'h', 'planned this week', '#60a5fa');
+  snapDrawStatCard(ctx, pad + cardW + cardGap, y, cardW, cardH,
+    avgSleep != null ? avgSleep.toFixed(1) + 'h' : '—',
+    avgSleep != null ? 'avg sleep (14 days)' : 'no sleep logged yet',
+    '#34d399');
+
+  y += cardH + 40;
+
+  // ---- Roles ----
+  if (state.roles.length > 0) {
+    ctx.fillStyle = '#5e6d87';
+    ctx.font = '600 13px "Inter", system-ui, sans-serif';
+    ctx.fillText('ROLES THIS WEEK', pad, y);
+    ctx.fillStyle = '#22304a';
+    ctx.fillRect(pad + 180, y - 6, contentW - 180, 1);
+    y += 22;
+
+    for (const r of state.roles.slice(0, 6)) {
+      const scheduled = minutesScheduledThisWeekByRole(r.id) / 60;
+      const budget = r.weeklyHoursBudget || 0;
+      snapDrawRoleRow(ctx, pad, y, contentW, r, scheduled, budget);
+      y += 44;
+    }
+    y += 12;
+  }
+
+  // ---- Charts ----
+  if (recent.length > 0) {
+    ctx.fillStyle = '#5e6d87';
+    ctx.font = '600 13px "Inter", system-ui, sans-serif';
+    ctx.fillText('ENERGY, LAST 14 DAYS', pad, y);
+    y += 18;
+    snapDrawEnergyChart(ctx, pad, y, contentW, 120, recent);
+    y += 140;
+
+    ctx.fillStyle = '#5e6d87';
+    ctx.font = '600 13px "Inter", system-ui, sans-serif';
+    ctx.fillText('SLEEP, LAST 14 DAYS', pad, y);
+    y += 18;
+    snapDrawSleepChart(ctx, pad, y, contentW, 90, recent);
+    y += 110;
+  } else {
+    // No data yet — a gentle note so the snapshot still makes sense.
+    ctx.fillStyle = '#5e6d87';
+    ctx.font = '500 16px "Inter", system-ui, sans-serif';
+    ctx.fillText('No check-ins logged yet. Two weeks is a good lens.', pad, y + 20);
+    y += 60;
+  }
+
+  // ---- Signal ----
+  const insights = computeInsights();
+  if (insights.length > 0) {
+    snapDrawSignal(ctx, pad, y, contentW, 90, insights[0]);
+    y += 110;
+  }
+
+  // ---- Footer ----
+  const footerY = H - pad;
+  ctx.fillStyle = '#5e6d87';
+  ctx.font = '500 14px "Inter", system-ui, sans-serif';
+  const ts = new Date().toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' });
+  ctx.fillText(`Shared from Pace · ${ts}`, pad, footerY);
+  ctx.textAlign = 'right';
+  ctx.fillText('Totals & trends only — no notes or task titles included.', W - pad, footerY);
+  ctx.textAlign = 'start';
+
+  return await new Promise((resolve) => canvas.toBlob(resolve, 'image/png', 0.95));
+}
+
+function snapDrawStatCard(ctx, x, y, w, h, big, label, color) {
+  ctx.fillStyle = '#131c30';
+  ctx.strokeStyle = '#22304a';
+  ctx.lineWidth = 1;
+  roundRect(ctx, x, y, w, h, 16);
+  ctx.fill();
+  ctx.stroke();
+
+  ctx.fillStyle = color;
+  ctx.font = '700 70px "JetBrains Mono", ui-monospace, monospace';
+  ctx.fillText(big, x + 28, y + 90);
+
+  ctx.fillStyle = '#93a2bd';
+  ctx.font = '500 16px "Inter", system-ui, sans-serif';
+  ctx.fillText(label, x + 28, y + 128);
+}
+
+function snapDrawRoleRow(ctx, x, y, w, role, scheduled, budget) {
+  // Swatch
+  ctx.fillStyle = role.color;
+  roundRect(ctx, x, y + 4, 10, 24, 3);
+  ctx.fill();
+
+  // Name
+  ctx.fillStyle = '#e5ecf5';
+  ctx.font = '600 18px "Inter", system-ui, sans-serif';
+  ctx.fillText(role.name, x + 22, y + 22);
+
+  // Bar
+  const barX = x + 260;
+  const barRight = x + w - 140;
+  const barW = barRight - barX;
+  const barY = y + 14;
+  ctx.fillStyle = '#1a2540';
+  roundRect(ctx, barX, barY, barW, 8, 4);
+  ctx.fill();
+  const pct = budget ? Math.min(1, scheduled / budget) : 0;
+  if (pct > 0) {
+    ctx.fillStyle = role.color;
+    roundRect(ctx, barX, barY, barW * pct, 8, 4);
+    ctx.fill();
+  }
+
+  // Numbers
+  ctx.fillStyle = '#93a2bd';
+  ctx.font = '500 15px "JetBrains Mono", ui-monospace, monospace';
+  ctx.textAlign = 'right';
+  ctx.fillText(`${scheduled.toFixed(1)} / ${budget || 0}h`, x + w, y + 22);
+  ctx.textAlign = 'start';
+}
+
+function snapDrawEnergyChart(ctx, x, y, w, h, data) {
+  // Guides at 1..5
+  ctx.strokeStyle = '#1a2540';
+  ctx.lineWidth = 1;
+  for (let i = 1; i <= 5; i++) {
+    const ly = y + h - ((i - 1) / 4) * h;
+    ctx.save();
+    ctx.setLineDash([2, 4]);
+    ctx.beginPath();
+    ctx.moveTo(x, ly);
+    ctx.lineTo(x + w, ly);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  const days = 14;
+  const today = new Date(isoDate());
+  const points = [];
+  for (let i = days - 1; i >= 0; i--) {
+    const d = addDays(today, -i);
+    const ds = isoDate(d);
+    const c = data.find((ci) => ci.date === ds);
+    const px = x + ((days - 1 - i) / (days - 1)) * w;
+    const py = c ? y + h - ((c.energy - 1) / 4) * h : null;
+    points.push({ x: px, y: py });
+  }
+  const valid = points.filter((p) => p.y != null);
+
+  if (valid.length > 1) {
+    // Area under
+    const grad = ctx.createLinearGradient(0, y, 0, y + h);
+    grad.addColorStop(0, 'rgba(96,165,250,0.25)');
+    grad.addColorStop(1, 'rgba(96,165,250,0)');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.moveTo(valid[0].x, y + h);
+    valid.forEach((p) => ctx.lineTo(p.x, p.y));
+    ctx.lineTo(valid[valid.length - 1].x, y + h);
+    ctx.closePath();
+    ctx.fill();
+
+    // Line
+    ctx.strokeStyle = '#60a5fa';
+    ctx.lineWidth = 2.5;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
+    ctx.beginPath();
+    valid.forEach((p, i) => (i === 0 ? ctx.moveTo(p.x, p.y) : ctx.lineTo(p.x, p.y)));
+    ctx.stroke();
+  }
+
+  // Dots
+  valid.forEach((p) => {
+    ctx.fillStyle = '#0b1220';
+    ctx.strokeStyle = '#60a5fa';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 3.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+  });
+}
+
+function snapDrawSleepChart(ctx, x, y, w, h, data) {
+  const days = 14;
+  const today = new Date(isoDate());
+  const barW = Math.max(6, w / days - 6);
+  const maxHrs = 10;
+
+  // Guides at 6 and 8
+  ctx.strokeStyle = '#1a2540';
+  ctx.lineWidth = 1;
+  for (const hrs of [6, 8]) {
+    const ly = y + h - (hrs / maxHrs) * h;
+    ctx.save();
+    ctx.setLineDash([2, 4]);
+    ctx.beginPath();
+    ctx.moveTo(x, ly);
+    ctx.lineTo(x + w, ly);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  for (let i = 0; i < days; i++) {
+    const d = addDays(today, -(days - 1 - i));
+    const ds = isoDate(d);
+    const c = data.find((ci) => ci.date === ds);
+    if (!c || c.sleepHours == null) continue;
+    const hrs = Math.min(c.sleepHours, maxHrs);
+    const bx = x + i * (w / days) + 2;
+    const bh = (hrs / maxHrs) * h;
+    const by = y + h - bh;
+    ctx.fillStyle = hrs < 6 ? '#f87171' : hrs < 7 ? '#fbbf24' : '#34d399';
+    roundRect(ctx, bx, by, barW, bh, 3);
+    ctx.fill();
+  }
+}
+
+function snapDrawSignal(ctx, x, y, w, h, insight) {
+  const palette = {
+    alarm: { bg: 'rgba(248,113,113,0.12)', stroke: '#f87171', dot: '#f87171' },
+    warn:  { bg: 'rgba(251,191,36,0.14)',  stroke: '#fbbf24', dot: '#fbbf24' },
+    calm:  { bg: 'rgba(52,211,153,0.12)',  stroke: '#34d399', dot: '#34d399' },
+  };
+  const c = palette[insight.level] || palette.warn;
+
+  ctx.fillStyle = c.bg;
+  ctx.strokeStyle = c.stroke;
+  ctx.lineWidth = 1;
+  roundRect(ctx, x, y, w, h, 12);
+  ctx.fill();
+  ctx.stroke();
+
+  // Dot
+  ctx.fillStyle = c.dot;
+  ctx.beginPath();
+  ctx.arc(x + 24, y + 30, 5, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Title
+  ctx.fillStyle = '#e5ecf5';
+  ctx.font = '600 18px "Inter", system-ui, sans-serif';
+  ctx.fillText(insight.title, x + 46, y + 34);
+
+  // Body (wrapped, max 2 lines)
+  ctx.fillStyle = '#93a2bd';
+  ctx.font = '400 15px "Inter", system-ui, sans-serif';
+  const lines = snapWrapText(ctx, insight.body, w - 68, 2);
+  lines.forEach((line, i) => ctx.fillText(line, x + 46, y + 58 + i * 20));
+}
+
+async function openSnapshotModal() {
+  const body = h(`
+    <div class="stack">
+      <p style="color:var(--text-muted); font-size:13px; margin:0">
+        This is what your mentor will see. Only totals and trends — no notes, no task titles, no specific check-in text.
+      </p>
+      <div class="snapshot-preview" data-role="snapshot-preview">
+        <div class="snapshot-loading">Generating…</div>
+      </div>
+    </div>
+  `);
+  const hasShare = !!(navigator.canShare && window.File);
+  const footer = `
+    <button class="btn btn-ghost" data-action="close-modal">Close</button>
+    <button class="btn btn-secondary" data-action="snapshot-download" disabled>Download PNG</button>
+    ${hasShare ? `<button class="btn btn-primary" data-action="snapshot-share" disabled>Share…</button>` : ''}
+  `;
+  openModal({
+    title: 'Share a snapshot',
+    body,
+    footer,
+    size: 'lg',
+    onMount: async () => {
+      const preview = document.querySelector('[data-role="snapshot-preview"]');
+      try {
+        const blob = await renderSnapshotBlob();
+        if (!blob) throw new Error('Image generation failed');
+        window.__paceSnapshot = blob;
+        const url = URL.createObjectURL(blob);
+        const img = new Image();
+        img.src = url;
+        img.alt = 'Snapshot preview';
+        img.className = 'snapshot-img';
+        img.onload = () => {
+          preview.innerHTML = '';
+          preview.appendChild(img);
+        };
+        document.querySelectorAll('[data-action="snapshot-download"], [data-action="snapshot-share"]').forEach((b) => b.disabled = false);
+      } catch (e) {
+        preview.innerHTML = `<div class="snapshot-loading" style="color:var(--danger)">Could not generate snapshot: ${esc(e.message)}</div>`;
+      }
+    },
+  });
+}
+
+function snapshotDownload() {
+  const blob = window.__paceSnapshot;
+  if (!blob) return;
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `pace-snapshot-${isoDate()}.png`;
+  a.click();
+  URL.revokeObjectURL(url);
+  toast('Saved', 'success');
+}
+
+async function snapshotShare() {
+  const blob = window.__paceSnapshot;
+  if (!blob) return;
+  const file = new File([blob], `pace-snapshot-${isoDate()}.png`, { type: 'image/png' });
+  if (navigator.canShare && navigator.canShare({ files: [file] })) {
+    try {
+      await navigator.share({
+        title: 'My week',
+        text: `A snapshot from Pace · week of ${shortDate(startOfWeek(new Date(), state.settings.weekStartsMonday))}`,
+        files: [file],
+      });
+    } catch (e) {
+      if (e && e.name !== 'AbortError') toast('Share cancelled', 'error');
+    }
+  } else {
+    snapshotDownload();
+  }
+}
+
+/* ============================================================
    TOAST
    ============================================================ */
 
@@ -388,7 +884,7 @@ function renderToday() {
   // Insights
   const insights = computeInsights();
   if (insights.length) {
-    const card = h(`<section class="card" style="margin-top:20px"><div class="card-heading"><h2>Signals</h2></div></section>`);
+    const card = h(`<section class="card"><div class="card-heading"><h2>Signals</h2></div></section>`);
     const stack = div('stack');
     insights.forEach((ins) => {
       stack.appendChild(h(`
@@ -971,7 +1467,13 @@ function renderReflect() {
         <h1>Reflect</h1>
         <div class="view-subtitle">Patterns only show up when you track. Two weeks is a good lens.</div>
       </div>
-      ${!todayCheckIn() ? `<button class="btn btn-primary" data-action="open-checkin-modal">Log today</button>` : ''}
+      <div class="row" style="gap:8px">
+        ${!todayCheckIn() ? `<button class="btn btn-primary" data-action="open-checkin-modal">Log today</button>` : ''}
+        <button class="btn btn-secondary" data-action="open-snapshot">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12v8a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-8"/><polyline points="16 6 12 2 8 6"/><line x1="12" y1="2" x2="12" y2="15"/></svg>
+          Share snapshot
+        </button>
+      </div>
     </div>
   `));
 
@@ -1256,21 +1758,48 @@ function renderSettings() {
   `);
   wrap.appendChild(appearance);
 
-  // Data
+  // Data — full backup (private, portable, for moving between devices)
+  const lastExp = state.lastExportedAt
+    ? `Last exported ${snapshotRelativeTime(state.lastExportedAt)}`
+    : 'Never exported';
   const data = h(`
     <section class="card settings-section">
-      <h2>Data</h2>
-      <p style="color:var(--text-muted); font-size:13px; margin-bottom:14px">
-        Everything lives in your browser (<code style="font-family:var(--font-mono); font-size:12px; color:var(--text-muted)">localStorage</code>). Export regularly so you can move it around.
+      <h2>Back up &amp; move data</h2>
+      <p style="color:var(--text-muted); font-size:13px; margin-bottom:6px">
+        Your full planner lives in this browser only. There is no cloud account, nothing is sent anywhere automatically. Export a JSON file to move to another device, back up, or recover after a browser reset.
       </p>
+      <div class="hint" style="font-size:12px; color:var(--text-subtle); margin-bottom:14px">${esc(lastExp)}</div>
       <div class="row">
-        <button class="btn btn-secondary" data-action="export-data">Export JSON</button>
-        <button class="btn btn-secondary" data-action="import-data">Import JSON</button>
+        <button class="btn btn-primary" data-action="export-data">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          Export JSON
+        </button>
+        <button class="btn btn-secondary" data-action="import-data">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+          Import JSON
+        </button>
         <button class="btn btn-danger" data-action="reset-data" style="margin-left:auto">Reset everything</button>
       </div>
     </section>
   `);
   wrap.appendChild(data);
+
+  // Snapshot — mentor-safe share
+  const snap = h(`
+    <section class="card settings-section">
+      <h2>Share a snapshot</h2>
+      <p style="color:var(--text-muted); font-size:13px; margin-bottom:14px">
+        Export an image with totals and trends — no notes, no task titles, no specific check-in text. Safe to send a mentor or coach who just wants to see how the week looks, without reading your journal.
+      </p>
+      <div class="row">
+        <button class="btn btn-primary" data-action="open-snapshot">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+          Generate snapshot
+        </button>
+      </div>
+    </section>
+  `);
+  wrap.appendChild(snap);
 
   // Wire live inputs
   wrap.querySelectorAll('[data-set]').forEach((inp) => {
@@ -1767,6 +2296,8 @@ function exportData() {
   a.download = `pace-export-${isoDate()}.json`;
   a.click();
   URL.revokeObjectURL(url);
+  setState((st) => ({ ...st, lastExportedAt: Date.now() }), { rerender: false });
+  if (currentView() === 'settings') render();
   toast('Exported');
 }
 
@@ -1797,7 +2328,9 @@ function importData() {
 function resetData() {
   if (!confirm('This erases all roles, tasks, blocks, and check-ins. Are you sure?')) return;
   state = structuredClone(DEFAULT_STATE);
-  saveState();
+  // Clear both backing stores.
+  idbSet('state', state).catch(() => {});
+  try { localStorage.removeItem(STORAGE_KEY); } catch {}
   applyTheme();
   location.hash = '#/today';
   render();
@@ -1860,6 +2393,10 @@ document.addEventListener('click', (e) => {
     case 'export-data': exportData(); break;
     case 'import-data': importData(); break;
     case 'reset-data': resetData(); break;
+
+    case 'open-snapshot': openSnapshotModal(); break;
+    case 'snapshot-download': snapshotDownload(); break;
+    case 'snapshot-share': snapshotShare(); break;
   }
 });
 
@@ -1867,8 +2404,16 @@ document.addEventListener('click', (e) => {
    INIT
    ============================================================ */
 
-function init() {
+async function init() {
+  await loadStateAsync();
   applyTheme();
+
+  // Ask the browser not to evict our IDB under storage pressure.
+  // Installed PWAs are usually granted silently; browsers may prompt otherwise.
+  if (navigator.storage && navigator.storage.persist) {
+    navigator.storage.persist().catch(() => {});
+  }
+
   window.addEventListener('hashchange', render);
   if (!location.hash) location.hash = '#/today';
   render();
